@@ -1,205 +1,181 @@
-from flask import Flask, render_template, request, jsonify
-import cv2
-import numpy as np
-from PIL import Image
-import imagehash
 import io
 import os
+from typing import Dict
+
+import cv2
+import imagehash
+import numpy as np
+import streamlit as st
 import torch
-import torchvision.transforms as transforms
 import torchvision.models as models
-from torch.nn.functional import cosine_similarity
+import torchvision.transforms as transforms
+from PIL import Image
 from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine_similarity
 
-app = Flask(__name__)
+st.set_page_config(page_title="AI Image Similarity", layout="centered")
 
-# Load pre-trained ResNet model
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = models.resnet50(pretrained=True).to(device)
-model.eval()
 
-# Define image transformations
-preprocess = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+@st.cache_resource
+def load_model():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # load pretrained ResNet50
+    model = models.resnet50(pretrained=True).to(device)
+    model.eval()
+    preprocess = transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    return model, preprocess, device
 
-def get_image_features(img):
-    """Extract features using both traditional CV and deep learning approaches."""
-    # Convert PIL image to OpenCV format for traditional features
+
+def get_image_features(img: Image.Image, model, preprocess, device) -> Dict:
+    """Extract features: ResNet deep features, perceptual hash, color hist, SIFT descriptor summary."""
+    # Convert PIL -> OpenCV BGR
     img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-    
-    # 1. Deep Learning Features (ResNet)
+
+    # 1) Deep features (ResNet)
     with torch.no_grad():
         img_tensor = preprocess(img).unsqueeze(0).to(device)
-        print(f"Input tensor shape: {img_tensor.shape}")
-        deep_features = model.forward(img_tensor)
-        print(f"ResNet features shape: {deep_features.shape}")
-        deep_features = deep_features.squeeze().cpu().numpy()
-        print(f"Final features shape: {deep_features.shape}, Range: [{deep_features.min():.2f}, {deep_features.max():.2f}]")
-    
-    # 2. Perceptual hash (using a larger hash size for better accuracy)
-    phash = imagehash.average_hash(img, hash_size=8)  # 8x8 = 64-bit hash
-    print(f"Generated perceptual hash: {phash}")
-    
-    # 3. Color histogram
-    hist = cv2.calcHist([img_cv], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+        feats = model(img_tensor)
+        deep_features = feats.squeeze().cpu().numpy()
+
+    # 2) Perceptual hash (average hash, 8 -> 64 bits)
+    phash = imagehash.average_hash(img, hash_size=8)
+
+    # 3) Color histogram (8x8x8 bins) normalized
+    hist = cv2.calcHist([img_cv], [0, 1, 2], None, [8, 8, 8],
+                        [0, 256, 0, 256, 0, 256])
     hist = cv2.normalize(hist, hist).flatten()
-    
-    # 4. SIFT features (simplified to top K keypoints)
-    sift = cv2.SIFT_create()
-    _, descs = sift.detectAndCompute(cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY), None)
-    if descs is not None:
-        descs = np.mean(descs, axis=0) if len(descs) > 0 else np.zeros(128)
-    else:
-        descs = np.zeros(128)
-    
+
+    # 4) SIFT (mean of descriptors or zeros)
+    try:
+        sift = cv2.SIFT_create()
+        _, descs = sift.detectAndCompute(cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY), None)
+        if descs is not None and len(descs) > 0:
+            descs = np.mean(descs, axis=0)
+        else:
+            descs = np.zeros(128, dtype=np.float32)
+    except Exception:
+        # if SIFT not available for some reason, fallback to zeros
+        descs = np.zeros(128, dtype=np.float32)
+
     return {
-        'deep_features': deep_features,
-        'phash': phash,
-        'hist': hist,
-        'sift': descs
+        "deep_features": deep_features,
+        "phash": phash,
+        "hist": hist,
+        "sift": descs,
     }
 
-def calculate_similarity(features1, features2):
-    """Calculate similarity using both deep learning and traditional features."""
-    
+
+def calculate_similarity(f1: Dict, f2: Dict) -> Dict:
+    """Combine deep + phash + hist + sift into 0-100 metrics and weighted final score."""
     try:
-        # 1. Deep Learning similarity (using cosine similarity)
-        deep_features1 = features1['deep_features'].reshape(1, -1)
-        deep_features2 = features2['deep_features'].reshape(1, -1)
-        deep_similarity = float(sklearn_cosine_similarity(deep_features1, deep_features2)[0][0])
-        # Convert from -1:1 range to 0:100 range
-        deep_similarity = (deep_similarity + 1) * 50
-        
-        # 2. Perceptual hash similarity (0-100)
-        try:
-            # Calculate hamming distance between hashes and convert to percentage
-            hash_diff = float(features1['phash'] - features2['phash'])
-            max_hash_diff = 64.0  # ImageHash uses 64-bit hashes
-            phash_similarity = 100.0 * (1.0 - hash_diff / max_hash_diff)
-            print(f"Hash 1: {features1['phash']}")
-            print(f"Hash 2: {features2['phash']}")
-            print(f"Hash difference: {hash_diff}/{max_hash_diff} -> Similarity: {phash_similarity:.2f}%")
-        except Exception as e:
-            print(f"Error in phash calculation: {str(e)}")
-            phash_similarity = 0.0
-        
-        # 3. Histogram similarity (0-100)
-        hist_similarity = float(cv2.compareHist(
-            features1['hist'].reshape(-1, 1),
-            features2['hist'].reshape(-1, 1),
-            cv2.HISTCMP_CORREL
-        ))
-        # Convert from -1:1 range to 0:100 range
-        hist_similarity = (hist_similarity + 1) * 50
-        
-        # 4. SIFT features similarity (0-100)
-        sift_diff = np.linalg.norm(features1['sift'] - features2['sift'])
-        sift_similarity = max(0, 100 - (sift_diff * 100 / (np.sqrt(128) * 255)))  # 128 is SIFT descriptor size
-        
-        # Ensure all similarities are in valid range
-        deep_similarity = max(0, min(100, deep_similarity))
-        phash_similarity = max(0, min(100, phash_similarity))
-        hist_similarity = max(0, min(100, hist_similarity))
-        sift_similarity = max(0, min(100, sift_similarity))
-        
-        # Weighted average (adjustable weights)
-        weights = [0.4, 0.2, 0.2, 0.2]  # deep learning, phash, histogram, SIFT
-        final_similarity = (
-            weights[0] * deep_similarity +
-            weights[1] * phash_similarity +
-            weights[2] * hist_similarity +
-            weights[3] * sift_similarity
+        # deep: cosine similarity from -1..1 -> 0..100
+        d1 = f1["deep_features"].reshape(1, -1)
+        d2 = f2["deep_features"].reshape(1, -1)
+        deep_sim = float(sklearn_cosine_similarity(d1, d2)[0][0])
+        deep_sim = (deep_sim + 1.0) * 50.0
+
+        # phash: hamming distance -> 0..100
+        max_hash_diff = 64.0
+        hash_diff = float(f1["phash"] - f2["phash"])
+        phash_sim = 100.0 * (1.0 - (hash_diff / max_hash_diff))
+
+        # hist: cv2.HISTCMP_CORREL returns -1..1 -> map to 0..100
+        hist_sim = float(cv2.compareHist(f1["hist"].reshape(-1, 1),
+                                         f2["hist"].reshape(-1, 1),
+                                         cv2.HISTCMP_CORREL))
+        hist_sim = (hist_sim + 1.0) * 50.0
+
+        # sift: euclidean distance -> inverted score 0..100
+        sift_diff = np.linalg.norm(f1["sift"] - f2["sift"])
+        sift_sim = max(0.0, 100.0 - (sift_diff * 100.0 / (np.sqrt(128) * 255.0)))
+
+        # clamp
+        deep_sim = max(0.0, min(100.0, deep_sim))
+        phash_sim = max(0.0, min(100.0, phash_sim))
+        hist_sim = max(0.0, min(100.0, hist_sim))
+        sift_sim = max(0.0, min(100.0, sift_sim))
+
+        weights = [0.4, 0.2, 0.2, 0.2]
+        final = (
+            weights[0] * deep_sim +
+            weights[1] * phash_sim +
+            weights[2] * hist_sim +
+            weights[3] * sift_sim
         )
-        
+        final = max(0.0, min(100.0, final))
+
         return {
-            'final': max(0, min(100, float(final_similarity))),
-            'deep': float(deep_similarity),
-            'phash': float(phash_similarity),
-            'hist': float(hist_similarity),
-            'sift': float(sift_similarity)
+            "final": final,
+            "deep": deep_sim,
+            "phash": phash_sim,
+            "hist": hist_sim,
+            "sift": sift_sim,
         }
-        
     except Exception as e:
-        print(f"Error in similarity calculation: {str(e)}")
-        # Return safe default values in case of error
-        return {
-            'final': 0.0,
-            'deep': 0.0,
-            'phash': 0.0,
-            'hist': 0.0,
-            'sift': 0.0
-        }
-from flask import send_file
-
-@app.route('/')
-def home():
-    return send_file('index.html')
+        st.error(f"Error computing similarity: {e}")
+        return {"final": 0.0, "deep": 0.0, "phash": 0.0, "hist": 0.0, "sift": 0.0}
 
 
-@app.route('/compare', methods=['POST'])
-def compare_images():
+# ---------- Streamlit UI ----------
+st.title("AI Image Similarity Comparison")
+
+col1, col2 = st.columns(2)
+uploaded1 = col1.file_uploader("Upload image 1", type=["png", "jpg", "jpeg"])
+uploaded2 = col2.file_uploader("Upload image 2", type=["png", "jpg", "jpeg"])
+
+st.markdown("---")
+st.caption("Model: ResNet50 (pretrained). This runs on CPU if GPU not available.")
+
+model, preprocess, device = load_model()
+
+if uploaded1 is not None:
     try:
-        # Get images from request
-        if 'image1' not in request.files or 'image2' not in request.files:
-            return jsonify({
-                'success': False,
-                'message': "Both images are required"
-            }), 400
-            
-        image1 = request.files['image1']
-        image2 = request.files['image2']
-
-        # Open and process images
-        try:
-            img1 = Image.open(io.BytesIO(image1.read())).convert('RGB')
-            img2 = Image.open(io.BytesIO(image2.read())).convert('RGB')
-        except Exception as e:
-            return jsonify({
-                'success': False,
-                'message': "Invalid image format"
-            }), 400
-
-        # Get features
-        try:
-            features1 = get_image_features(img1)
-            features2 = get_image_features(img2)
-            print("Successfully extracted features")
-        except Exception as e:
-            print(f"Error extracting features: {str(e)}")
-            raise
-
-        # Calculate similarity
-        try:
-            # Use the combined ML and traditional similarity calculation
-            similarities = calculate_similarity(features1, features2)
-            print(f"Deep Learning similarity: {similarities['deep']:.2f}%")
-            print(f"Individual similarities - Phash: {similarities['phash']:.2f}%, " +
-                  f"Hist: {similarities['hist']:.2f}%, SIFT: {similarities['sift']:.2f}%")
-            print(f"Final similarity score: {similarities['final']:.2f}%")
-        except Exception as e:
-            print(f"Error calculating similarity: {str(e)}")
-            raise
-
-        return jsonify({
-            'success': True,
-            'similarity': f"{similarities['final']:.2f}",
-            'deep_similarity': f"{similarities['deep']:.2f}",
-            'phash_similarity': f"{similarities['phash']:.2f}",
-            'hist_similarity': f"{similarities['hist']:.2f}",
-            'sift_similarity': f"{similarities['sift']:.2f}",
-            'message': 'Comparison completed successfully'
-        })
+        img1 = Image.open(io.BytesIO(uploaded1.read())).convert("RGB")
+        col1.image(img1, use_column_width=True, caption="Image 1 preview")
     except Exception as e:
-        print(f"Error in comparison: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'message': 'Failed to compare images'
-        }), 400
+        col1.error(f"Failed to read image 1: {e}")
+        uploaded1 = None
 
-if __name__ == '__main__':
-    app.run(debug=True)
+if uploaded2 is not None:
+    try:
+        img2 = Image.open(io.BytesIO(uploaded2.read())).convert("RGB")
+        col2.image(img2, use_column_width=True, caption="Image 2 preview")
+    except Exception as e:
+        col2.error(f"Failed to read image 2: {e}")
+        uploaded2 = None
+
+if st.button("Compare Images"):
+    if uploaded1 is None or uploaded2 is None:
+        st.warning("Please upload both images.")
+    else:
+        with st.spinner("Extracting features and computing similarity..."):
+            # reload images from uploaded bytes (files were consumed above)
+            img1 = Image.open(io.BytesIO(uploaded1.getvalue())).convert("RGB")
+            img2 = Image.open(io.BytesIO(uploaded2.getvalue())).convert("RGB")
+
+            f1 = get_image_features(img1, model, preprocess, device)
+            f2 = get_image_features(img2, model, preprocess, device)
+
+            sims = calculate_similarity(f1, f2)
+
+        st.success(f"Overall Similarity: {sims['final']:.2f}%")
+        st.metric(label="Deep (ML) similarity", value=f"{sims['deep']:.2f}%")
+        st.metric(label="Perceptual hash similarity", value=f"{sims['phash']:.2f}%")
+        st.metric(label="Color histogram similarity", value=f"{sims['hist']:.2f}%")
+        st.metric(label="SIFT similarity", value=f"{sims['sift']:.2f}%")
+        st.progress(int(round(sims["final"])))
+        st.write("**Detailed breakdown**")
+        st.write({
+            "final": f"{sims['final']:.2f}%",
+            "deep": f"{sims['deep']:.2f}%",
+            "phash": f"{sims['phash']:.2f}%",
+            "hist": f"{sims['hist']:.2f}%",
+            "sift": f"{sims['sift']:.2f}%"
+        })
