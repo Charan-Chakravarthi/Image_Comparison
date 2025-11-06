@@ -133,10 +133,12 @@ def calculate_similarity(features1, features2):
             'hist': 0.0,
             'sift': 0.0
         }
+from flask import send_file
 
 @app.route('/')
 def home():
-    return render_template('index.html')
+    return send_file('index.html')
+
 
 @app.route('/compare', methods=['POST'])
 def compare_images():
