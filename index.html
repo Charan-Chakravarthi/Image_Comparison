@@ -1,354 +1,181 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Image Comparison</title>
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-            font-family: 'Poppins', sans-serif;
+import io
+import os
+from typing import Dict
+
+import cv2
+import imagehash
+import numpy as np
+import streamlit as st
+import torch
+import torchvision.models as models
+import torchvision.transforms as transforms
+from PIL import Image
+from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine_similarity
+
+st.set_page_config(page_title="AI Image Similarity", layout="centered")
+
+
+@st.cache_resource
+def load_model():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # load pretrained ResNet50
+    model = models.resnet50(pretrained=True).to(device)
+    model.eval()
+    preprocess = transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    return model, preprocess, device
+
+
+def get_image_features(img: Image.Image, model, preprocess, device) -> Dict:
+    """Extract features: ResNet deep features, perceptual hash, color hist, SIFT descriptor summary."""
+    # Convert PIL -> OpenCV BGR
+    img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+    # 1) Deep features (ResNet)
+    with torch.no_grad():
+        img_tensor = preprocess(img).unsqueeze(0).to(device)
+        feats = model(img_tensor)
+        deep_features = feats.squeeze().cpu().numpy()
+
+    # 2) Perceptual hash (average hash, 8 -> 64 bits)
+    phash = imagehash.average_hash(img, hash_size=8)
+
+    # 3) Color histogram (8x8x8 bins) normalized
+    hist = cv2.calcHist([img_cv], [0, 1, 2], None, [8, 8, 8],
+                        [0, 256, 0, 256, 0, 256])
+    hist = cv2.normalize(hist, hist).flatten()
+
+    # 4) SIFT (mean of descriptors or zeros)
+    try:
+        sift = cv2.SIFT_create()
+        _, descs = sift.detectAndCompute(cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY), None)
+        if descs is not None and len(descs) > 0:
+            descs = np.mean(descs, axis=0)
+        else:
+            descs = np.zeros(128, dtype=np.float32)
+    except Exception:
+        # if SIFT not available for some reason, fallback to zeros
+        descs = np.zeros(128, dtype=np.float32)
+
+    return {
+        "deep_features": deep_features,
+        "phash": phash,
+        "hist": hist,
+        "sift": descs,
+    }
+
+
+def calculate_similarity(f1: Dict, f2: Dict) -> Dict:
+    """Combine deep + phash + hist + sift into 0-100 metrics and weighted final score."""
+    try:
+        # deep: cosine similarity from -1..1 -> 0..100
+        d1 = f1["deep_features"].reshape(1, -1)
+        d2 = f2["deep_features"].reshape(1, -1)
+        deep_sim = float(sklearn_cosine_similarity(d1, d2)[0][0])
+        deep_sim = (deep_sim + 1.0) * 50.0
+
+        # phash: hamming distance -> 0..100
+        max_hash_diff = 64.0
+        hash_diff = float(f1["phash"] - f2["phash"])
+        phash_sim = 100.0 * (1.0 - (hash_diff / max_hash_diff))
+
+        # hist: cv2.HISTCMP_CORREL returns -1..1 -> map to 0..100
+        hist_sim = float(cv2.compareHist(f1["hist"].reshape(-1, 1),
+                                         f2["hist"].reshape(-1, 1),
+                                         cv2.HISTCMP_CORREL))
+        hist_sim = (hist_sim + 1.0) * 50.0
+
+        # sift: euclidean distance -> inverted score 0..100
+        sift_diff = np.linalg.norm(f1["sift"] - f2["sift"])
+        sift_sim = max(0.0, 100.0 - (sift_diff * 100.0 / (np.sqrt(128) * 255.0)))
+
+        # clamp
+        deep_sim = max(0.0, min(100.0, deep_sim))
+        phash_sim = max(0.0, min(100.0, phash_sim))
+        hist_sim = max(0.0, min(100.0, hist_sim))
+        sift_sim = max(0.0, min(100.0, sift_sim))
+
+        weights = [0.4, 0.2, 0.2, 0.2]
+        final = (
+            weights[0] * deep_sim +
+            weights[1] * phash_sim +
+            weights[2] * hist_sim +
+            weights[3] * sift_sim
+        )
+        final = max(0.0, min(100.0, final))
+
+        return {
+            "final": final,
+            "deep": deep_sim,
+            "phash": phash_sim,
+            "hist": hist_sim,
+            "sift": sift_sim,
         }
+    except Exception as e:
+        st.error(f"Error computing similarity: {e}")
+        return {"final": 0.0, "deep": 0.0, "phash": 0.0, "hist": 0.0, "sift": 0.0}
 
-        body {
-            min-height: 100vh;
-            background: linear-gradient(135deg, #1a1a1a, #4a4a4a);
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            color: white;
-        }
 
-        .container {
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
-            padding: 2rem;
-            border-radius: 20px;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-            width: 90%;
-            max-width: 1000px;
-        }
+# ---------- Streamlit UI ----------
+st.title("AI Image Similarity Comparison")
 
-        h1 {
-            text-align: center;
-            margin-bottom: 2rem;
-            font-size: 2.5rem;
-            background: linear-gradient(45deg, #ff6b6b, #4ecdc4);
-            background-clip: text;
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            color: transparent;
-        }
+col1, col2 = st.columns(2)
+uploaded1 = col1.file_uploader("Upload image 1", type=["png", "jpg", "jpeg"])
+uploaded2 = col2.file_uploader("Upload image 2", type=["png", "jpg", "jpeg"])
 
-        .image-container {
-            display: flex;
-            justify-content: space-around;
-            flex-wrap: wrap;
-            gap: 2rem;
-            margin-bottom: 2rem;
-        }
+st.markdown("---")
+st.caption("Model: ResNet50 (pretrained). This runs on CPU if GPU not available.")
 
-        .image-box {
-            flex: 1;
-            min-width: 300px;
-            text-align: center;
-        }
+model, preprocess, device = load_model()
 
-        .preview {
-            width: 100%;
-            height: 300px;
-            border: 2px dashed rgba(255, 255, 255, 0.3);
-            border-radius: 10px;
-            margin-bottom: 1rem;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            background-size: cover;
-            background-position: center;
-        }
+if uploaded1 is not None:
+    try:
+        img1 = Image.open(io.BytesIO(uploaded1.read())).convert("RGB")
+        col1.image(img1, use_column_width=True, caption="Image 1 preview")
+    except Exception as e:
+        col1.error(f"Failed to read image 1: {e}")
+        uploaded1 = None
 
-        .preview:hover {
-            border-color: #4ecdc4;
-        }
+if uploaded2 is not None:
+    try:
+        img2 = Image.open(io.BytesIO(uploaded2.read())).convert("RGB")
+        col2.image(img2, use_column_width=True, caption="Image 2 preview")
+    except Exception as e:
+        col2.error(f"Failed to read image 2: {e}")
+        uploaded2 = None
 
-        .preview img {
-            max-width: 100%;
-            max-height: 100%;
-            display: none;
-        }
+if st.button("Compare Images"):
+    if uploaded1 is None or uploaded2 is None:
+        st.warning("Please upload both images.")
+    else:
+        with st.spinner("Extracting features and computing similarity..."):
+            # reload images from uploaded bytes (files were consumed above)
+            img1 = Image.open(io.BytesIO(uploaded1.getvalue())).convert("RGB")
+            img2 = Image.open(io.BytesIO(uploaded2.getvalue())).convert("RGB")
 
-        input[type="file"] {
-            display: none;
-        }
+            f1 = get_image_features(img1, model, preprocess, device)
+            f2 = get_image_features(img2, model, preprocess, device)
 
-        .upload-btn {
-            background: linear-gradient(45deg, #ff6b6b, #4ecdc4);
-            color: white;
-            padding: 0.8rem 1.5rem;
-            border: none;
-            border-radius: 25px;
-            cursor: pointer;
-            transition: transform 0.3s ease;
-        }
+            sims = calculate_similarity(f1, f2)
 
-        .upload-btn:hover {
-            transform: translateY(-2px);
-        }
-
-        #compareBtn {
-            display: block;
-            margin: 2rem auto;
-            padding: 1rem 2rem;
-            font-size: 1.2rem;
-            background: linear-gradient(45deg, #4ecdc4, #ff6b6b);
-            color: white;
-            border: none;
-            border-radius: 25px;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-
-        #compareBtn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
-        }
-
-        #result {
-            text-align: center;
-            font-size: 1.2rem;
-            margin-top: 2rem;
-            padding: 1.5rem;
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 10px;
-                display: none;
-            transform: translateY(20px);
-            transition: all 0.5s ease;
-        }
-
-        #result.show {
-                display: block;
-            transform: translateY(0);
-        }
-
-        .similarity-metric {
-            margin: 0.5rem 0;
-            padding: 0.5rem;
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 5px;
-            position: relative;
-        }
-
-        .metric-label {
-            font-size: 0.9rem;
-            color: #4ecdc4;
-            margin-right: 0.5rem;
-        }
-        
-        .highlight-ml {
-            background: rgba(78, 205, 196, 0.1);
-            border: 1px solid rgba(78, 205, 196, 0.2);
-        }
-
-        .ml-badge {
-            position: absolute;
-            right: 10px;
-            top: 50%;
-            transform: translateY(-50%);
-            background: linear-gradient(45deg, #4ecdc4, #ff6b6b);
-            color: white;
-            padding: 2px 8px;
-            border-radius: 12px;
-            font-size: 0.7rem;
-            font-weight: bold;
-            z-index: 1;
-        }
-
-        .progress-bar {
-            position: absolute;
-            left: 0;
-            top: 0;
-            height: 100%;
-            background: linear-gradient(to right, rgba(78, 205, 196, 0.1), rgba(78, 205, 196, 0.2));
-            border-radius: 5px;
-            transition: width 0.5s ease-out;
-            z-index: 0;
-        }
-
-        .highlight-ml .progress-bar {
-            background: linear-gradient(to right, rgba(78, 205, 196, 0.2), rgba(255, 107, 107, 0.2));
-        }
-
-        .final-similarity {
-            font-size: 1.5rem;
-            color: #ff6b6b;
-            margin: 1rem 0;
-            font-weight: bold;
-        }
-
-        .loading {
-            display: none;
-            text-align: center;
-            margin-top: 1rem;
-        }
-
-        .loading::after {
-            content: "";
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 3px solid #4ecdc4;
-            border-radius: 50%;
-            border-top-color: transparent;
-            animation: spin 1s linear infinite;
-        }
-
-        @keyframes spin {
-            to {
-                transform: rotate(360deg);
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>AI Image Similarity Comparison</h1>
-        <div class="image-container">
-            <div class="image-box">
-                <div class="preview" id="preview1" onclick="document.getElementById('image1').click()">
-                    <span>Click to upload first image</span>
-                </div>
-                <input type="file" id="image1" accept="image/*">
-                <button class="upload-btn" onclick="document.getElementById('image1').click()">Choose Image 1</button>
-            </div>
-            <div class="image-box">
-                <div class="preview" id="preview2" onclick="document.getElementById('image2').click()">
-                    <span>Click to upload second image</span>
-                </div>
-                <input type="file" id="image2" accept="image/*">
-                <button class="upload-btn" onclick="document.getElementById('image2').click()">Choose Image 2</button>
-            </div>
-        </div>
-        <button id="compareBtn" disabled>Compare Images</button>
-        <div class="loading" id="loading"></div>
-        <div id="result"></div>
-    </div>
-
-    <script>
-        let images = {
-            image1: null,
-            image2: null
-        };
-
-        function handleImageUpload(input, previewId) {
-            const file = input.files[0];
-            if (file) {
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    const preview = document.getElementById(previewId);
-                    preview.style.backgroundImage = `url(${e.target.result})`;
-                    preview.innerHTML = '';
-                    images[input.id] = file;
-                    checkEnableCompare();
-                }
-                reader.readAsDataURL(file);
-            }
-        }
-
-        function checkEnableCompare() {
-            const compareBtn = document.getElementById('compareBtn');
-            compareBtn.disabled = !(images.image1 && images.image2);
-        }
-
-        document.getElementById('image1').addEventListener('change', function() {
-            handleImageUpload(this, 'preview1');
-        });
-
-        document.getElementById('image2').addEventListener('change', function() {
-            handleImageUpload(this, 'preview2');
-        });
-
-        document.getElementById('compareBtn').addEventListener('click', async function() {
-            const loading = document.getElementById('loading');
-            const result = document.getElementById('result');
-            const formData = new FormData();
-
-            loading.style.display = 'block';
-            // reset result visibility
-            result.style.display = 'none';
-            result.style.opacity = '';
-
-            formData.append('image1', images.image1);
-            formData.append('image2', images.image2);
-
-            try {
-                const response = await fetch('/compare', {
-                    method: 'POST',
-                    body: formData
-                });
-                
-                if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
-                }
-                
-                const data = await response.json();
-                console.log('Server response:', data);
-                
-                if (!data.success) {
-                    throw new Error(data.message || data.error || 'Unknown error occurred');
-                }
-
-                    console.log('Setting result HTML with data:', {
-                        similarity: data.similarity,
-                        phash: data.phash_similarity,
-                        hist: data.hist_similarity,
-                        sift: data.sift_similarity
-                    });
-                
-                const formatPercent = (value) => {
-                    const num = parseFloat(value);
-                    return isNaN(num) ? '0.00' : num.toFixed(2);
-                };
-                
-                const resultHTML = `
-                    <div class="final-similarity">Overall Similarity: ${formatPercent(data.similarity)}%</div>
-                    <div class="similarity-metric highlight-ml">
-                        <span class="metric-label">Deep Learning Similarity:</span> ${formatPercent(data.deep_similarity)}%
-                        <div class="ml-badge">ML</div>
-                        <div class="progress-bar" style="width: ${formatPercent(data.deep_similarity)}%"></div>
-                    </div>
-                    <div class="similarity-metric">
-                        <span class="metric-label">Perceptual Hash Similarity:</span> ${formatPercent(data.phash_similarity)}%
-                        <div class="progress-bar" style="width: ${formatPercent(data.phash_similarity)}%"></div>
-                    </div>
-                    <div class="similarity-metric">
-                        <span class="metric-label">Color Histogram Similarity:</span> ${formatPercent(data.hist_similarity)}%
-                        <div class="progress-bar" style="width: ${formatPercent(data.hist_similarity)}%"></div>
-                    </div>
-                    <div class="similarity-metric">
-                        <span class="metric-label">SIFT Features Similarity:</span> ${formatPercent(data.sift_similarity)}%
-                        <div class="progress-bar" style="width: ${formatPercent(data.sift_similarity)}%"></div>
-                    </div>`;                    result.innerHTML = resultHTML;
-                result.classList.add('show');
-                result.style.display = 'block';
-                // ensure visible if any leftover opacity was set
-                result.style.opacity = '1';
-                result.style.color = '#4ecdc4';
-            } catch (error) {
-                console.error('Error:', error);
-                result.textContent = `Error: ${error.message}`;
-                result.classList.add('show');
-                result.style.display = 'block';
-                result.style.opacity = '1';
-                result.style.color = '#ff6b6b';
-            } finally {
-                loading.style.display = 'none';
-            }
-        });
-    </script>
-</body>
-</html>
+        st.success(f"Overall Similarity: {sims['final']:.2f}%")
+        st.metric(label="Deep (ML) similarity", value=f"{sims['deep']:.2f}%")
+        st.metric(label="Perceptual hash similarity", value=f"{sims['phash']:.2f}%")
+        st.metric(label="Color histogram similarity", value=f"{sims['hist']:.2f}%")
+        st.metric(label="SIFT similarity", value=f"{sims['sift']:.2f}%")
+        st.progress(int(round(sims["final"])))
+        st.write("**Detailed breakdown**")
+        st.write({
+            "final": f"{sims['final']:.2f}%",
+            "deep": f"{sims['deep']:.2f}%",
+            "phash": f"{sims['phash']:.2f}%",
+            "hist": f"{sims['hist']:.2f}%",
+            "sift": f"{sims['sift']:.2f}%"
+        })
