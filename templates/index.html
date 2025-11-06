@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Image Comparison</title>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Poppins', sans-serif;
+        }
+
+        body {
+            min-height: 100vh;
+            background: linear-gradient(135deg, #1a1a1a, #4a4a4a);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: white;
+        }
+
+        .container {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            padding: 2rem;
+            border-radius: 20px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            width: 90%;
+            max-width: 1000px;
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 2rem;
+            font-size: 2.5rem;
+            background: linear-gradient(45deg, #ff6b6b, #4ecdc4);
+            background-clip: text;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            color: transparent;
+        }
+
+        .image-container {
+            display: flex;
+            justify-content: space-around;
+            flex-wrap: wrap;
+            gap: 2rem;
+            margin-bottom: 2rem;
+        }
+
+        .image-box {
+            flex: 1;
+            min-width: 300px;
+            text-align: center;
+        }
+
+        .preview {
+            width: 100%;
+            height: 300px;
+            border: 2px dashed rgba(255, 255, 255, 0.3);
+            border-radius: 10px;
+            margin-bottom: 1rem;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background-size: cover;
+            background-position: center;
+        }
+
+        .preview:hover {
+            border-color: #4ecdc4;
+        }
+
+        .preview img {
+            max-width: 100%;
+            max-height: 100%;
+            display: none;
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+
+        .upload-btn {
+            background: linear-gradient(45deg, #ff6b6b, #4ecdc4);
+            color: white;
+            padding: 0.8rem 1.5rem;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            transition: transform 0.3s ease;
+        }
+
+        .upload-btn:hover {
+            transform: translateY(-2px);
+        }
+
+        #compareBtn {
+            display: block;
+            margin: 2rem auto;
+            padding: 1rem 2rem;
+            font-size: 1.2rem;
+            background: linear-gradient(45deg, #4ecdc4, #ff6b6b);
+            color: white;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        #compareBtn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+        }
+
+        #result {
+            text-align: center;
+            font-size: 1.2rem;
+            margin-top: 2rem;
+            padding: 1.5rem;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+                display: none;
+            transform: translateY(20px);
+            transition: all 0.5s ease;
+        }
+
+        #result.show {
+                display: block;
+            transform: translateY(0);
+        }
+
+        .similarity-metric {
+            margin: 0.5rem 0;
+            padding: 0.5rem;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 5px;
+            position: relative;
+        }
+
+        .metric-label {
+            font-size: 0.9rem;
+            color: #4ecdc4;
+            margin-right: 0.5rem;
+        }
+        
+        .highlight-ml {
+            background: rgba(78, 205, 196, 0.1);
+            border: 1px solid rgba(78, 205, 196, 0.2);
+        }
+
+        .ml-badge {
+            position: absolute;
+            right: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: linear-gradient(45deg, #4ecdc4, #ff6b6b);
+            color: white;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.7rem;
+            font-weight: bold;
+            z-index: 1;
+        }
+
+        .progress-bar {
+            position: absolute;
+            left: 0;
+            top: 0;
+            height: 100%;
+            background: linear-gradient(to right, rgba(78, 205, 196, 0.1), rgba(78, 205, 196, 0.2));
+            border-radius: 5px;
+            transition: width 0.5s ease-out;
+            z-index: 0;
+        }
+
+        .highlight-ml .progress-bar {
+            background: linear-gradient(to right, rgba(78, 205, 196, 0.2), rgba(255, 107, 107, 0.2));
+        }
+
+        .final-similarity {
+            font-size: 1.5rem;
+            color: #ff6b6b;
+            margin: 1rem 0;
+            font-weight: bold;
+        }
+
+        .loading {
+            display: none;
+            text-align: center;
+            margin-top: 1rem;
+        }
+
+        .loading::after {
+            content: "";
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #4ecdc4;
+            border-radius: 50%;
+            border-top-color: transparent;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>AI Image Similarity Comparison</h1>
+        <div class="image-container">
+            <div class="image-box">
+                <div class="preview" id="preview1" onclick="document.getElementById('image1').click()">
+                    <span>Click to upload first image</span>
+                </div>
+                <input type="file" id="image1" accept="image/*">
+                <button class="upload-btn" onclick="document.getElementById('image1').click()">Choose Image 1</button>
+            </div>
+            <div class="image-box">
+                <div class="preview" id="preview2" onclick="document.getElementById('image2').click()">
+                    <span>Click to upload second image</span>
+                </div>
+                <input type="file" id="image2" accept="image/*">
+                <button class="upload-btn" onclick="document.getElementById('image2').click()">Choose Image 2</button>
+            </div>
+        </div>
+        <button id="compareBtn" disabled>Compare Images</button>
+        <div class="loading" id="loading"></div>
+        <div id="result"></div>
+    </div>
+
+    <script>
+        let images = {
+            image1: null,
+            image2: null
+        };
+
+        function handleImageUpload(input, previewId) {
+            const file = input.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const preview = document.getElementById(previewId);
+                    preview.style.backgroundImage = `url(${e.target.result})`;
+                    preview.innerHTML = '';
+                    images[input.id] = file;
+                    checkEnableCompare();
+                }
+                reader.readAsDataURL(file);
+            }
+        }
+
+        function checkEnableCompare() {
+            const compareBtn = document.getElementById('compareBtn');
+            compareBtn.disabled = !(images.image1 && images.image2);
+        }
+
+        document.getElementById('image1').addEventListener('change', function() {
+            handleImageUpload(this, 'preview1');
+        });
+
+        document.getElementById('image2').addEventListener('change', function() {
+            handleImageUpload(this, 'preview2');
+        });
+
+        document.getElementById('compareBtn').addEventListener('click', async function() {
+            const loading = document.getElementById('loading');
+            const result = document.getElementById('result');
+            const formData = new FormData();
+
+            loading.style.display = 'block';
+            // reset result visibility
+            result.style.display = 'none';
+            result.style.opacity = '';
+
+            formData.append('image1', images.image1);
+            formData.append('image2', images.image2);
+
+            try {
+                const response = await fetch('/compare', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const data = await response.json();
+                console.log('Server response:', data);
+                
+                if (!data.success) {
+                    throw new Error(data.message || data.error || 'Unknown error occurred');
+                }
+
+                    console.log('Setting result HTML with data:', {
+                        similarity: data.similarity,
+                        phash: data.phash_similarity,
+                        hist: data.hist_similarity,
+                        sift: data.sift_similarity
+                    });
+                
+                const formatPercent = (value) => {
+                    const num = parseFloat(value);
+                    return isNaN(num) ? '0.00' : num.toFixed(2);
+                };
+                
+                const resultHTML = `
+                    <div class="final-similarity">Overall Similarity: ${formatPercent(data.similarity)}%</div>
+                    <div class="similarity-metric highlight-ml">
+                        <span class="metric-label">Deep Learning Similarity:</span> ${formatPercent(data.deep_similarity)}%
+                        <div class="ml-badge">ML</div>
+                        <div class="progress-bar" style="width: ${formatPercent(data.deep_similarity)}%"></div>
+                    </div>
+                    <div class="similarity-metric">
+                        <span class="metric-label">Perceptual Hash Similarity:</span> ${formatPercent(data.phash_similarity)}%
+                        <div class="progress-bar" style="width: ${formatPercent(data.phash_similarity)}%"></div>
+                    </div>
+                    <div class="similarity-metric">
+                        <span class="metric-label">Color Histogram Similarity:</span> ${formatPercent(data.hist_similarity)}%
+                        <div class="progress-bar" style="width: ${formatPercent(data.hist_similarity)}%"></div>
+                    </div>
+                    <div class="similarity-metric">
+                        <span class="metric-label">SIFT Features Similarity:</span> ${formatPercent(data.sift_similarity)}%
+                        <div class="progress-bar" style="width: ${formatPercent(data.sift_similarity)}%"></div>
+                    </div>`;                    result.innerHTML = resultHTML;
+                result.classList.add('show');
+                result.style.display = 'block';
+                // ensure visible if any leftover opacity was set
+                result.style.opacity = '1';
+                result.style.color = '#4ecdc4';
+            } catch (error) {
+                console.error('Error:', error);
+                result.textContent = `Error: ${error.message}`;
+                result.classList.add('show');
+                result.style.display = 'block';
+                result.style.opacity = '1';
+                result.style.color = '#ff6b6b';
+            } finally {
+                loading.style.display = 'none';
+            }
+        });
+    </script>
+</body>
+</html>
